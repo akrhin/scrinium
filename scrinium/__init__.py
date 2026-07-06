@@ -611,7 +611,12 @@ async def serve_frontend():
     template = Path(__file__).parent / "templates" / "index.html"
     if not template.exists():
         return HTMLResponse("<h1>Scrinium</h1><p>Frontend not found.</p>")
-    return HTMLResponse(template.read_text(encoding="utf-8"))
+    html = template.read_text(encoding="utf-8")
+    # Cache-bust: add timestamp so browser never caches old HTML
+    ts = datetime.now().strftime("%Y%m%d%H%M")
+    html = html.replace("</head>", f'<meta name="version" content="{ts}"></head>')
+    headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+    return HTMLResponse(html, headers=headers)
 
 
 # ── Entry ───────────────────────────────────────────────────────────────

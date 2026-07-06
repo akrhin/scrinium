@@ -1,45 +1,44 @@
 """
 Scrinium — RAG Chat over your documents.
 
-FastAPI backend with:
-  • JWT auth (multiple users)
-  • File upload → docling-mcp → chunk → ChromaDB
-  • Chat: semantic search + LLM answer
-  • Chat history (sessions)
-  • Responsive single-page frontend
+FastAPI web frontend. Shares ChromaDB with docling-search (MCP):
+  • Same DB: ~/docling-search/chroma/
+  • Same model: jinaai/jina-embeddings-v3 (fastembed)
+  • Same collection: "docs"
+  • What you upload via web → I find via MCP tools
 """
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import bcrypt
-import chromadb
 import httpx
 import jwt
 import aiofiles
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy import (
-    create_engine, Column, String, Text, Integer, Float, DateTime, ForeignKey,
+    create_engine, Column, String, Text, Integer, DateTime, ForeignKey,
     select, func, JSON as SQLJSON
 )
-from sqlalchemy.orm import declarative_base, Session as SASession, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ── Config ─────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-CHROMA_PATH = Path(os.getenv("CHROMA_PATH", "./data/chroma"))
+# ChromaDB — shared with docling-search MCP
+CHROMA_DIR = os.path.expanduser(os.getenv("CHROMA_DIR", "~/docling-search/chroma"))
+CHROMA_COLLECTION = "docs"
+
 DB_PATH = Path(os.getenv("DB_PATH", "./data/scrinium.db"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./data/uploads"))
 JWT_SECRET = os.getenv("JWT_SECRET", "")
@@ -56,14 +55,31 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_me")
 
-USERS = {}  # populated at startup
-
-CHROMA_COLLECTION = "scrinium"
-DOCLING_SCRIPT = os.getenv("DOCLING_SCRIPT", "")
-
-# Ensure dirs
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+os.makedirs(CHROMA_DIR, exist_ok=True)
+
+# ── Shared embedder (same as docling-search) ───────────────────────────
+
+_embedder = None
+_chroma = None
+
+
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding(model_name="jinaai/jina-embeddings-v3")
+    return _embedder
+
+
+def _get_chroma():
+    global _chroma
+    if _chroma is None:
+        import chromadb
+        client = chromadb.PersistentClient(path=CHROMA_DIR)
+        _chroma = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
+    return _chroma
+
 
 # ── Database ────────────────────────────────────────────────────────────
 
@@ -112,20 +128,6 @@ class Document(Base):
 
 
 Base.metadata.create_all(engine)
-
-# ── ChromaDB ────────────────────────────────────────────────────────────
-
-_chroma_client: chromadb.ClientAPI | None = None
-_chroma_collection = None
-
-
-def _get_chroma():
-    global _chroma_client, _chroma_collection
-    if _chroma_client is None:
-        _chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-        _chroma_collection = _chroma_client.get_or_create_collection(CHROMA_COLLECTION)
-    return _chroma_collection
-
 
 # ── Auth ────────────────────────────────────────────────────────────────
 
@@ -183,45 +185,53 @@ async def _llm_ask(system: str, messages: list[dict]) -> str:
 
 # ── Document processing ────────────────────────────────────────────────
 
-_SUPPORTED_EXT = {".pdf", ".txt", ".md", ".html", ".htm", ".json", ".csv", ".xml", ".yaml", ".yml", ".rst", ".rtf", ".epub", ".docx", ".xlsx", ".pptx"}
+_SUPPORTED_EXT = {".pdf", ".txt", ".md", ".html", ".htm", ".json", ".csv",
+                  ".xml", ".yaml", ".yml", ".rst", ".rtf", ".epub",
+                  ".docx", ".xlsx", ".pptx"}
 
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 150
+CHUNK_MIN = 200
+CHUNK_MAX = 2000
 
 
 def _chunk_text(text: str, source: str) -> list[tuple[str, str]]:
-    """Return list of (chunk_text, chunk_id)"""
+    """Chunk by paragraphs — same logic as docling-search."""
+    import re
     chunks = []
-    words = text.split()
-    i = 0
-    while i < len(words):
-        chunk = " ".join(words[i : i + CHUNK_SIZE])
-        chunk_id = f"{source}#chunk{len(chunks)}"
-        chunks.append((chunk, chunk_id))
-        i += CHUNK_SIZE - CHUNK_OVERLAP
-        if i >= len(words):
-            break
+    paragraphs = re.split(r'\n\s*\n', text)
+    current = ""
+    idx = 0
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if len(current) + len(para) < CHUNK_MAX:
+            current += "\n\n" + para if current else para
+        else:
+            if current:
+                chunk_id = f"{source}#ch{idx}"
+                chunks.append((current, chunk_id))
+                idx += 1
+            current = para
+    if current:
+        chunk_id = f"{source}#ch{idx}"
+        chunks.append((current, chunk_id))
     return chunks
 
 
 async def _process_file(filepath: Path, filename: str) -> tuple[str, int, str]:
-    """Convert file to markdown using docling, return (markdown, pages, doc_id)"""
+    """Convert file to markdown using docling, return (markdown, pages, doc_id)."""
     doc_id = f"{uuid.uuid4().hex[:12]}"
-
     ext = Path(filename).suffix.lower()
 
-    # Plain text — read directly
     if ext in {".txt", ".md", ".html", ".htm", ".json", ".csv", ".xml", ".yaml", ".yml", ".rst"}:
         async with aiofiles.open(filepath, "r", encoding="utf-8", errors="replace") as f:
             text = await f.read()
         return text, 0, doc_id
 
-    # Binary/document formats — use docling
     return await _run_docling(filepath, doc_id)
 
 
 async def _run_docling(filepath: Path, doc_id: str) -> tuple[str, int, str]:
-    """Run docling on a binary document. Runs in thread to avoid blocking."""
     import asyncio
     from docling.document_converter import DocumentConverter
 
@@ -237,35 +247,44 @@ async def _run_docling(filepath: Path, doc_id: str) -> tuple[str, int, str]:
     return markdown, pages, doc_id
 
 
-async def _index_document(text: str, doc_id: str, filename: str, user_id: int) -> int:
-    """Chunk text and index into ChromaDB"""
-    collection = _get_chroma()
+async def _index_document(text: str, doc_id: str, filename: str) -> int:
+    """Chunk + embed with jina-embeddings-v3 → ChromaDB (shared with docling-search)."""
+    import numpy as np
+    emb = _get_embedder()
+    col = _get_chroma()
     chunks = _chunk_text(text, doc_id)
 
-    metadatas = []
-    ids = []
-    documents = []
+    texts = [c[0] for c in chunks]
+    ids = [c[1] for c in chunks]
+    metadatas = [{"doc_id": doc_id, "filename": filename, "source": cid} for cid in ids]
 
-    for chunk_text, chunk_id in chunks:
-        documents.append(chunk_text)
-        ids.append(chunk_id)
-        metadatas.append({
-            "doc_id": doc_id,
-            "filename": filename,
-            "source": chunk_id,
-        })
-
-    if documents:
-        collection.add(documents=documents, ids=ids, metadatas=metadatas)
+    BATCH = 20
+    for i in range(0, len(texts), BATCH):
+        batch_texts = texts[i : i + BATCH]
+        batch_ids = ids[i : i + BATCH]
+        batch_meta = metadatas[i : i + BATCH]
+        vecs = [v / np.linalg.norm(v) for v in list(emb.embed(batch_texts, embed_type="passage"))]
+        col.add(
+            ids=batch_ids,
+            embeddings=[v.tolist() for v in vecs],
+            documents=batch_texts,
+            metadatas=batch_meta,
+        )
 
     return len(chunks)
 
 
 async def _search_chroma(query: str, top_k: int = 5) -> list[dict]:
-    """Search ChromaDB and return results with source info"""
-    collection = _get_chroma()
+    """Embed query → search ChromaDB (jina, cosine, normalized)."""
+    emb = _get_embedder()
+    col = _get_chroma()
+
+    import numpy as np
+    vec = list(emb.query_embed(query))
+    vec_norm = np.array(vec) / np.linalg.norm(vec)
+
     try:
-        results = collection.query(query_texts=[query], n_results=top_k)
+        results = col.query(query_embeddings=[vec_norm.tolist()], n_results=top_k)
     except Exception:
         return []
 
@@ -289,26 +308,29 @@ async def _search_chroma(query: str, top_k: int = 5) -> list[dict]:
 
 app = FastAPI(title="Scrinium", version="0.1.0")
 
+import starlette.datastructures
+app.file_max_size = 100 * 1024 * 1024
+
 
 @app.on_event("startup")
 async def startup():
-    # Ensure admin user exists
     db = SessionLocal()
     try:
         existing = db.execute(select(User).where(User.username == ADMIN_USER)).scalar_one_or_none()
         if existing is None:
             db.add(User(username=ADMIN_USER, password_hash=_hash_pw(ADMIN_PASSWORD)))
-            db.commit()
+        else:
+            if not _check_pw(ADMIN_PASSWORD, existing.password_hash):
+                existing.password_hash = _hash_pw(ADMIN_PASSWORD)
+        db.commit()
     finally:
         db.close()
 
-    # Ensure ChromaDB collection exists
-    _get_chroma()
+    # Preload embedder (not blocking — happens in thread)
+    _get_embedder()
 
 
 # ── API Routes ──────────────────────────────────────────────────────────
-
-# --- Auth ---
 
 class LoginRequest(BaseModel):
     username: str
@@ -333,14 +355,12 @@ async def api_me(username: str = Depends(_get_current_user)):
     return {"username": username}
 
 
-# --- Documents ---
-
 @app.post("/api/upload")
 async def api_upload(
     file: UploadFile = File(...),
     username: str = Depends(_get_current_user),
 ):
-    """Upload a file → docling → ChromaDB"""
+    """Upload a file → docling → ChromaDB (shared with docling-search MCP)."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file")
 
@@ -358,7 +378,7 @@ async def api_upload(
     db = SessionLocal()
     try:
         user = db.execute(select(User).where(User.username == username)).scalar_one()
-        chunks = await _index_document(markdown, doc_id, file.filename, user.id)
+        chunks = await _index_document(markdown, doc_id, file.filename)
         doc = Document(
             filename=file.filename,
             filepath=str(filepath),
@@ -413,18 +433,12 @@ async def api_delete_document(doc_id: str, username: str = Depends(_get_current_
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
         db.delete(doc)
-
-        # Remove from ChromaDB
-        collection = _get_chroma()
-        collection.delete(where={"doc_id": doc_id})
-
+        _get_chroma().delete(where={"doc_id": doc_id})
         db.commit()
         return {"message": "Deleted"}
     finally:
         db.close()
 
-
-# --- Chat ---
 
 class ChatRequest(BaseModel):
     message: str
@@ -440,7 +454,6 @@ async def api_chat(
     try:
         user = db.execute(select(User).where(User.username == username)).scalar_one()
 
-        # Resolve session
         if req.session_id:
             session = db.execute(
                 select(ChatSession).where(
@@ -459,13 +472,10 @@ async def api_chat(
             db.add(session)
             db.commit()
 
-        # Save user message
         db.add(Message(session_id=session.id, role="user", content=req.message))
 
-        # Search
         sources = await _search_chroma(req.message, top_k=5)
 
-        # Build context
         context_parts = []
         doc_map = {}
         for s in sources:
@@ -486,7 +496,6 @@ async def api_chat(
         )
 
         has_context = bool(context_parts)
-
         llm_messages = []
         if has_context:
             llm_messages.append({
@@ -504,7 +513,6 @@ async def api_chat(
 
         answer = await _llm_ask(system_prompt, llm_messages)
 
-        # Save assistant message
         msg = Message(
             session_id=session.id,
             role="assistant",
@@ -579,8 +587,6 @@ async def api_delete_session(session_id: str, username: str = Depends(_get_curre
         db.close()
 
 
-# --- LLM settings (per-user in-memory — can extend to DB later) ---
-
 class LLMSettings(BaseModel):
     base_url: str = ""
     model: str = ""
@@ -604,7 +610,7 @@ async def api_llm_settings_get(username: str = Depends(_get_current_user)):
 async def serve_frontend():
     template = Path(__file__).parent / "templates" / "index.html"
     if not template.exists():
-        return HTMLResponse("<h1>Scrinium</h1><p>Frontend not found. Run from project root.</p>")
+        return HTMLResponse("<h1>Scrinium</h1><p>Frontend not found.</p>")
     return HTMLResponse(template.read_text(encoding="utf-8"))
 
 
@@ -612,5 +618,5 @@ async def serve_frontend():
 
 if __name__ == "__main__":
     import uvicorn
-    PORT = int(os.getenv("PORT", "9231"))
-    uvicorn.run("scrinium.__main__:app", host="0.0.0.0", port=PORT, reload=True)
+    port = int(os.getenv("PORT", "9231"))
+    uvicorn.run("scrinium:app", host="0.0.0.0", port=port, reload=False)

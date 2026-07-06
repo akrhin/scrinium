@@ -39,7 +39,9 @@ input:focus,textarea:focus{border-color:var(--accent)}
 #app.hidden{display:none}
 
 /* Sidebar */
-#sidebar{width:300px;min-width:300px;background:var(--surface);display:flex;flex-direction:column;border-right:1px solid var(--surface2);overflow:hidden}
+#sidebar{width:300px;min-width:300px;background:var(--surface);display:flex;flex-direction:column;border-right:1px solid var(--surface2);overflow:hidden;z-index:50}
+#sidebar-overlay{display:none;position:fixed;inset:0;z-index:40;background:rgba(0,0,0,0.4)}
+#sidebar-overlay.visible{display:block}
 .sidebar-header{padding:16px;border-bottom:1px solid var(--surface2);display:flex;align-items:center;justify-content:space-between}
 .sidebar-header h2{font-size:18px;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .sidebar-header .user-badge{font-size:12px;color:var(--text2);background:var(--surface2);padding:4px 10px;border-radius:20px}
@@ -201,6 +203,9 @@ input:focus,textarea:focus{border-color:var(--accent)}
     </div>
   </div>
 
+  <!-- Overlay for mobile sidebar -->
+  <div id="sidebar-overlay" onclick="toggleSidebar()"></div>
+
   <!-- Main -->
   <div id="main">
     <div id="chat-header">
@@ -349,9 +354,12 @@ function logout() {
 // Enter to login
 document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key==='Enter') login(); });
 
-// ── Sidebar ──────────────────────────────────────────────
+// ── Sidebar ──────────��───────────────────────────────────
 function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('open');
+  const s = document.getElementById('sidebar');
+  const o = document.getElementById('sidebar-overlay');
+  s.classList.toggle('open');
+  o.classList.toggle('visible');
 }
 
 // ── Documents ────────────────────────────────────────────
@@ -397,14 +405,15 @@ function handleDrop(e) {
 }
 
 async function handleFile(file) {
+  console.log('handleFile called', file?.name, file?.size);
   if(!file || UPLOADING) return;
   UPLOADING = true;
-  toggleUpload();
+  document.getElementById('upload-area').classList.add('visible');
   const prog = document.getElementById('upload-progress');
   prog.classList.add('visible');
   document.getElementById('upload-filename').textContent = file.name;
-  document.getElementById('upload-bar').style.width = '20%';
-  document.getElementById('upload-status').textContent = 'Отправка...';
+  document.getElementById('upload-bar').style.width = '10%';
+  document.getElementById('upload-status').textContent = '⏳ Загружаю...';
 
   const form = new FormData();
   form.append('file', file);
@@ -418,11 +427,13 @@ async function handleFile(file) {
     document.getElementById('upload-bar').style.width = '100%';
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail);
+    console.log('Upload OK:', d);
     document.getElementById('upload-status').textContent = `✅ ${d.chunks} чанков проиндексировано`;
-    setTimeout(() => prog.classList.remove('visible'), 2000);
+    setTimeout(() => { prog.classList.remove('visible'); }, 2000);
     loadDocuments();
-    toast(`Загружен: ${d.filename}`, 'success');
+    toast(`Загружен: ${d.filename} (${d.chunks} чанков)`, 'success');
   } catch(e) {
+    console.error('Upload error:', e);
     document.getElementById('upload-bar').style.width = '0%';
     document.getElementById('upload-status').textContent = `❌ ${e.message || 'Ошибка загрузки'}`;
     toast(e.message || 'Ошибка загрузки', 'error');
@@ -548,7 +559,7 @@ function markdownToHtml(text) {
 
 function scrollToBottom() {
   const el = document.getElementById('chat-messages');
-  setTimeout(() => { el.scrollTop = el.scrollHeight; }, 50);
+  requestAnimationFrame(() => el.scrollTop = el.scrollHeight);
 }
 
 // Auto-resize textarea

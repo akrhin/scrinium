@@ -419,11 +419,16 @@ async function handleFile(file) {
   form.append('file', file);
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000); // 2 min
+
     const r = await fetch('/api/upload', {
       method:'POST',
       headers:{'Authorization':`Bearer ${TOKEN}`},
-      body: form
+      body: form,
+      signal: controller.signal
     });
+    clearTimeout(timeout);
     document.getElementById('upload-bar').style.width = '100%';
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail);
@@ -435,8 +440,11 @@ async function handleFile(file) {
   } catch(e) {
     console.error('Upload error:', e);
     document.getElementById('upload-bar').style.width = '0%';
-    document.getElementById('upload-status').textContent = `❌ ${e.message || 'Ошибка загрузки'}`;
-    toast(e.message || 'Ошибка загрузки', 'error');
+    const msg = e.name === 'AbortError'
+      ? '❌ Сервер не ответил за 2 минуты. Файл слишком большой или повреждён.'
+      : `❌ ${e.message || 'Ошибка загрузки'}`;
+    document.getElementById('upload-status').textContent = msg;
+    toast(msg, 'error');
   }
   UPLOADING = false;
 }

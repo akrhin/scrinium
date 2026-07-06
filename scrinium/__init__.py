@@ -9,6 +9,7 @@ FastAPI web frontend. Shares ChromaDB with docling-search (MCP):
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import os
@@ -307,7 +308,6 @@ async def _run_docling(filepath: Path, doc_id: str) -> tuple[str, int, str]:
         return await _run_docling_remote(filepath, doc_id)
 
     # Local: subprocess через convert.py
-    import asyncio
     convert_script = Path(__file__).parent / "convert.py"
 
     proc = await asyncio.create_subprocess_exec(
@@ -316,9 +316,16 @@ async def _run_docling(filepath: Path, doc_id: str) -> tuple[str, int, str]:
         stderr=asyncio.subprocess.PIPE,
     )
 
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise asyncio.TimeoutError("Конвертация не завершилась за 5 минут")
+
+    if proc.returncode == -9:
+        raise RuntimeError("docling убит (OOM — не хватило памяти для конвертации PDF)")
     if proc.returncode != 0:
-        raise RuntimeError(f"docling failed: {stderr.decode()[:500]}")
+        raise RuntimeError(f"docling завершился с кодом {proc.returncode}: {stderr.decode()[:500]}")
 
     result = json.loads(stdout.decode())
     if "error" in result:
@@ -484,7 +491,21 @@ async def api_upload(
     async with aiofiles.open(filepath, "wb") as f:
         await f.write(content)
 
-    markdown, pages, doc_id = await _process_file(filepath, file.filename)
+    try:
+        markdown, pages, doc_id = await _process_file(filepath, file.filename)
+    except RuntimeError as e:
+        log.error("Docling conversion failed for %s: %s", file.filename, e)
+        filepath.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"Ошибка конвертации: {e}")
+    except asyncio.TimeoutError:
+        log.error("Docling conversion timed out for %s", file.filename)
+        filepath.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="Конвертация не завершилась за 5 минут. Файл слишком большой или повреждён.")
+    except Exception as e:
+        log.error("Unexpected conversion error for %s: %s", file.filename, e)
+        filepath.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"Неизвестная ошибка конвертации: проверьте логи")
+
     log.info("Doc converted: %s → %d chars, %d pages, id=%s", file.filename, len(markdown), pages, doc_id)
 
     db = SessionLocal()

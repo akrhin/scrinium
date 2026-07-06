@@ -418,6 +418,8 @@ async function handleFile(file) {
   const form = new FormData();
   form.append('file', file);
 
+  let uploadDone = false; // переключили на 100%?
+
   try {
     const result = await new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -428,6 +430,7 @@ async function handleFile(file) {
           document.getElementById('upload-bar').style.width = pct + '%';
           document.getElementById('upload-status').textContent = `⏫ Загружаю... ${pct}%`;
           if (pct >= 100) {
+            uploadDone = true;
             document.getElementById('upload-status').textContent = '🔄 Конвертирую и индексирую...';
           }
         }
@@ -446,11 +449,8 @@ async function handleFile(file) {
         }
       });
 
-      xhr.addEventListener('error', () => reject(new Error('Сетевая ошибка')));
+      xhr.addEventListener('error', () => reject(new Error('network')));
       xhr.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
-
-      xhr.timeout = 120000;
-      xhr.ontimeout = () => reject(new DOMException('timeout', 'AbortError'));
 
       xhr.open('POST', '/api/upload');
       xhr.setRequestHeader('Authorization', `Bearer ${TOKEN}`);
@@ -465,11 +465,29 @@ async function handleFile(file) {
   } catch(e) {
     console.error('Upload error:', e);
     document.getElementById('upload-bar').style.width = '0%';
-    const msg = e.name === 'AbortError'
-      ? '❌ Сервер не ответил за 2 минуты.'
-      : `❌ ${e.message || 'Ошибка загрузки'}`;
-    document.getElementById('upload-status').textContent = msg;
-    toast(msg, 'error');
+
+    let msg;
+    if (uploadDone) {
+      // файл загружен, но ответ не пришёл — браузер уснул
+      document.getElementById('upload-bar').style.width = '100%';
+      msg = '✅ Файл загружен. Обработка завершится на сервере.';
+      document.getElementById('upload-status').textContent = msg;
+      toast('Файл на сервере, проверьте список документов', 'success');
+      // перезагрузим список документов на всякий случай
+      setTimeout(loadDocuments, 3000);
+    } else if (e.message === 'network') {
+      msg = '❌ Сетевая ошибка. Проверьте подключение.';
+      document.getElementById('upload-status').textContent = msg;
+      toast(msg, 'error');
+    } else if (e.name === 'AbortError') {
+      msg = '❌ Соединение прервано. Попробуйте ещё раз.';
+      document.getElementById('upload-status').textContent = msg;
+      toast(msg, 'error');
+    } else {
+      msg = `❌ ${e.message || 'Ошибка загрузки'}`;
+      document.getElementById('upload-status').textContent = msg;
+      toast(msg, 'error');
+    }
   }
   UPLOADING = false;
 }

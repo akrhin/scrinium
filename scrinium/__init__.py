@@ -9,9 +9,14 @@ FastAPI web frontend. Shares ChromaDB with docling-search (MCP):
 """
 
 from __future__ import annotations
-
+import json
+import logging
 import os
+import sys
 import uuid
+
+log = logging.getLogger("scrinium")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -24,6 +29,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, Column, String, Text, Integer, DateTime, ForeignKey,
@@ -58,13 +64,37 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_me")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 os.makedirs(CHROMA_DIR, exist_ok=True)
 
-# ── Shared embedder (same as docling-search) ───────────────────────────
+# ── Embedding provider ────────────────────��────────────────────
 
-_embedder = None
+# local = fastembed + jina (бесплатно, ~700 MB RAM)
+# remote = OpenAI-совместимый API (zero RAM, нужен ключ)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
+
+# Для remote-режима:
+EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "").rstrip("/")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBEDDING_API_MODEL = os.getenv("EMBEDDING_API_MODEL", "text-embedding-3-small")
+
+_embedder = None  # fastembed (только для local)
 _chroma = None
+
+# Размерность векторов — важно для ChromaDB
+# По умолчанию 1024 (jina), для внешних API может отличаться
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+
+# ── Docling provider ─────────────────────────────────────────────
+
+# local = запускать docling в подпроцессе (convert.py)
+# remote = вызывать внешний HTTP API для конвертации
+DOCLING_PROVIDER = os.getenv("DOCLING_PROVIDER", "local")
+
+# Для remote-режима:
+DOCLING_API_URL = os.getenv("DOCLING_API_URL", "").rstrip("/")
+DOCLING_API_KEY = os.getenv("DOCLING_API_KEY", "")
 
 
 def _get_embedder():
+    """Lazy fastembed (только для local-режима)."""
     global _embedder
     if _embedder is None:
         from fastembed import TextEmbedding
@@ -77,8 +107,49 @@ def _get_chroma():
     if _chroma is None:
         import chromadb
         client = chromadb.PersistentClient(path=CHROMA_DIR)
-        _chroma = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
+        _chroma = client.get_or_create_collection("scrinium", metadata={"hnsw:space": "cosine"})
     return _chroma
+
+
+async def _embed_texts(texts: list[str], embed_type: str = "passage") -> list[list[float]]:
+    """
+    Заэмбедить список текстов.
+    embed_type: "passage" (для индексации) или "query" (для поиска).
+    В local-режиме это влияет на префикс в jina.
+    В remote-режиме игнорируется.
+    """
+    import numpy as np
+
+    if EMBEDDING_PROVIDER == "local":
+        emb = _get_embedder()
+        if embed_type == "query":
+            vecs = list(emb.query_embed(texts[0] if len(texts) == 1 else texts))
+        else:
+            vecs = list(emb.embed(texts, embed_type="passage"))
+        return [(np.array(v) / np.linalg.norm(v)).tolist() for v in vecs]
+
+    elif EMBEDDING_PROVIDER == "remote":
+        if not EMBEDDING_API_URL:
+            raise RuntimeError("EMBEDDING_API_URL не указан для remote-режима")
+        url = f"{EMBEDDING_API_URL}/embeddings"
+        headers = {"Content-Type": "application/json"}
+        if EMBEDDING_API_KEY:
+            headers["Authorization"] = f"Bearer {EMBEDDING_API_KEY}"
+        async with httpx.AsyncClient(timeout=30) as cl:
+            r = await cl.post(url, headers=headers, json={
+                "model": EMBEDDING_API_MODEL,
+                "input": texts,
+                "dimensions": 1024,
+            })
+        if r.status_code != 200:
+            raise RuntimeError(f"Embedding API error {r.status_code}: {r.text[:200]}")
+
+        data = r.json()
+        embeddings = [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
+        return [np.array(v / np.linalg.norm(v)).tolist() for v in embeddings]
+
+    else:
+        raise RuntimeError(f"Неизвестный EMBEDDING_PROVIDER: {EMBEDDING_PROVIDER}")
 
 
 # ── Database ────────────────────────────────────────────────────────────
@@ -230,27 +301,60 @@ async def _process_file(filepath: Path, filename: str) -> tuple[str, int, str]:
 
     return await _run_docling(filepath, doc_id)
 
-
 async def _run_docling(filepath: Path, doc_id: str) -> tuple[str, int, str]:
+    """Convert document to markdown. Local = subprocess, Remote = HTTP API."""
+    if DOCLING_PROVIDER == "remote":
+        return await _run_docling_remote(filepath, doc_id)
+
+    # Local: subprocess через convert.py
     import asyncio
-    from docling.document_converter import DocumentConverter
+    convert_script = Path(__file__).parent / "convert.py"
 
-    def _convert():
-        converter = DocumentConverter()
-        doc = converter.convert(str(filepath))
-        md = doc.document.export_to_markdown()
-        pages = len(doc.pages) if hasattr(doc, 'pages') else 0
-        return md, pages
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(convert_script), str(filepath),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
-    loop = asyncio.get_event_loop()
-    markdown, pages = await loop.run_in_executor(None, _convert)
-    return markdown, pages, doc_id
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"docling failed: {stderr.decode()[:500]}")
+
+    result = json.loads(stdout.decode())
+    if "error" in result:
+        raise RuntimeError(result["error"])
+
+    return result["markdown"], result["pages"], doc_id
+
+
+async def _run_docling_remote(filepath: Path, doc_id: str) -> tuple[str, int, str]:
+    """Convert file via external HTTP API (e.g. docling-serve running elsewhere)."""
+    if not DOCLING_API_URL:
+        raise RuntimeError("DOCLING_API_URL не у��азан для remote-режима")
+
+    async with aiofiles.open(filepath, "rb") as f:
+        content = await f.read()
+
+    filename = filepath.name
+    files = {"file": (filename, content, "application/octet-stream")}
+
+    headers = {}
+    if DOCLING_API_KEY:
+        headers["Authorization"] = f"Bearer {DOCLING_API_KEY}"
+
+    url = f"{DOCLING_API_URL}/convert"
+    async with httpx.AsyncClient(timeout=300) as cl:
+        r = await cl.post(url, files=files, headers=headers if headers else None)
+
+    if r.status_code != 200:
+        raise RuntimeError(f"docling remote error {r.status_code}: {r.text[:300]}")
+
+    data = r.json()
+    return data.get("markdown", ""), data.get("pages", 0), doc_id
 
 
 async def _index_document(text: str, doc_id: str, filename: str) -> int:
-    """Chunk + embed with jina-embeddings-v3 → ChromaDB (shared with docling-search)."""
-    import numpy as np
-    emb = _get_embedder()
+    """Chunk + embed → ChromaDB (shared with docling-search)."""
     col = _get_chroma()
     chunks = _chunk_text(text, doc_id)
 
@@ -263,10 +367,10 @@ async def _index_document(text: str, doc_id: str, filename: str) -> int:
         batch_texts = texts[i : i + BATCH]
         batch_ids = ids[i : i + BATCH]
         batch_meta = metadatas[i : i + BATCH]
-        vecs = [v / np.linalg.norm(v) for v in list(emb.embed(batch_texts, embed_type="passage"))]
+        vecs = await _embed_texts(batch_texts, embed_type="passage")
         col.add(
             ids=batch_ids,
-            embeddings=[v.tolist() for v in vecs],
+            embeddings=vecs,
             documents=batch_texts,
             metadatas=batch_meta,
         )
@@ -275,16 +379,12 @@ async def _index_document(text: str, doc_id: str, filename: str) -> int:
 
 
 async def _search_chroma(query: str, top_k: int = 5) -> list[dict]:
-    """Embed query → search ChromaDB (jina, cosine, normalized)."""
-    emb = _get_embedder()
+    """Embed query → search ChromaDB (cosine, normalized)."""
     col = _get_chroma()
-
-    import numpy as np
-    vec = list(emb.query_embed(query))
-    vec_norm = np.array(vec) / np.linalg.norm(vec)
+    vecs = await _embed_texts([query], embed_type="query")
 
     try:
-        results = col.query(query_embeddings=[vec_norm.tolist()], n_results=top_k)
+        results = col.query(query_embeddings=vecs, n_results=top_k)
     except Exception:
         return []
 
@@ -308,6 +408,15 @@ async def _search_chroma(query: str, top_k: int = 5) -> list[dict]:
 
 app = FastAPI(title="Scrinium", version="0.1.0")
 
+# CORS — allow access from any browser (phone, laptop, etc.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 import starlette.datastructures
 app.file_max_size = 100 * 1024 * 1024
 
@@ -326,8 +435,9 @@ async def startup():
     finally:
         db.close()
 
-    # Preload embedder (not blocking — happens in thread)
-    _get_embedder()
+    # Preload embedder (в local-режиме)
+    if EMBEDDING_PROVIDER == "local":
+        _get_embedder()
 
 
 # ── API Routes ──────────────────────────────────────────────────────────
@@ -370,10 +480,12 @@ async def api_upload(
 
     filepath = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
     content = await file.read()
+    log.info("Upload received: %s (%d bytes)", file.filename, len(content))
     async with aiofiles.open(filepath, "wb") as f:
         await f.write(content)
 
     markdown, pages, doc_id = await _process_file(filepath, file.filename)
+    log.info("Doc converted: %s → %d chars, %d pages, id=%s", file.filename, len(markdown), pages, doc_id)
 
     db = SessionLocal()
     try:

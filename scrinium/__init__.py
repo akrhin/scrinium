@@ -108,7 +108,7 @@ def _get_chroma():
     if _chroma is None:
         import chromadb
         client = chromadb.PersistentClient(path=CHROMA_DIR)
-        _chroma = client.get_or_create_collection("scrinium", metadata={"hnsw:space": "cosine"})
+        _chroma = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
     return _chroma
 
 

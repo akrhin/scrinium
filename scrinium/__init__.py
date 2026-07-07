@@ -367,7 +367,10 @@ async def _index_document(text: str, doc_id: str, filename: str) -> int:
 
     texts = [c[0] for c in chunks]
     ids = [c[1] for c in chunks]
-    metadatas = [{"doc_id": doc_id, "filename": filename, "source": cid} for cid in ids]
+    metadatas = [{
+        "doc_id": doc_id, "doc_name": filename, "header": "Раздел",
+        "seq": i, "source": filename
+    } for i, (cid, _) in enumerate(zip(ids, texts))]
 
     BATCH = 20
     for i in range(0, len(texts), BATCH):

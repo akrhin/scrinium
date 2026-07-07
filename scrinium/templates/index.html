@@ -470,7 +470,7 @@ async function handleFile(file) {
     if (uploadDone) {
       // файл загружен, но ответ не пришёл — браузер уснул
       document.getElementById('upload-bar').style.width = '100%';
-      msg = '✅ Файл загружен. Обработка завершится на сервере.';
+      msg = '✅ Файл загружен. Обработка может занять до 60 минут для больших PDF. Проверьте список документов позже.';
       document.getElementById('upload-status').textContent = msg;
       toast('Файл на сервере, проверьте список документов', 'success');
       // перезагрузим список документов на всякий случай

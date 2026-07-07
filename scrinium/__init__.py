@@ -317,10 +317,10 @@ async def _run_docling(filepath: Path, doc_id: str) -> tuple[str, int, str]:
     )
 
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3600)
     except asyncio.TimeoutError:
         proc.kill()
-        raise asyncio.TimeoutError("Конвертация не завершилась за 5 минут")
+        raise asyncio.TimeoutError("Конвертация не завершилась за 60 минут — файл слишком большой")
 
     if proc.returncode == -9:
         raise RuntimeError("docling убит (OOM — не хватило памяти для конвертации PDF)")

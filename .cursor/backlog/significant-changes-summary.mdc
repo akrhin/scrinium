@@ -1,0 +1,40 @@
+# Significant Changes Summary — Scrinium
+
+## v0.1.0 → v0.2.0 (2026-07-06 → 2026-07-07)
+
+### Architecture & Integration
+
+| Change | Description |
+|--------|-------------|
+| **Shared ChromaDB** | Scrinium now uses the same ChromaDB collection as docling-search, enabling cross-tool document access |
+| **Unified document collection** | Single `scrinium` collection for all sources — web uploads and MCP tools share the same data |
+| **Shared embedder** | Both Scrinium and docling-search use `jina-embeddings-v3` via fastembed from the same backend |
+| **Metadata alignment** | Metadata format standardized to `doc_name` + `header` across all components |
+
+### Improvements
+
+| Change | Description |
+|--------|-------------|
+| **Upload stability** | No timeout on uploads, abort support, OOM handling, graceful browser-sleep recovery |
+| **Real progress tracking** | XHR-based upload progress bar + conversion status feedback |
+| **Cache busting** | HTML templates served with cache-control headers and cache-busting |
+| **Logging** | Structured logging added throughout for debugging |
+| **Timeout increase** | Docling conversion timeout raised to 60 minutes for large PDFs |
+
+### The Stack (as documented)
+
+```
+┌─────────────────────────────────────────────────┐
+│                   User (Browser)                 │
+├─────────────────────────────────────────────────┤
+│              Scrinium (FastAPI)                  │
+│  - Web UI (upload + chat)                       │
+│  - REST API (documents + sessions)              │
+│  - JWT authentication                           │
+├──────────────────┬──────────────────────────────┤
+│  docling-mcp     │   docling-search             │
+│  (PDF→Markdown)  │   (semantic search)          │
+├──────────────────┴──────────────────────────────┤
+│              ChromaDB + jina-embeddings-v3       │
+└─────────────────────────────────────────────────┘
+```

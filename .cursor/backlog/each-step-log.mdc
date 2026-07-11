@@ -1,0 +1,55 @@
+# Each Step Log — Scrinium
+
+## 2026-07-06
+
+### bcd3979 — Scrinium v0.1.0 — RAG Chat over your documents
+- Initial release of Scrinium: web UI for document upload + RAG chat with LLM
+- Core stack: FastAPI backend, ChromaDB for vector storage, jina-embeddings-v3
+- PDF/docx upload and conversion via docling
+- JWT-based login, chat sessions with history, document management API
+
+### 6fc0888 — Scrinium v0.2.0 — shared ChromaDB with docling-search
+- Switched to shared ChromaDB collection for interoperability with docling-search
+- Both Scrinium and docling-search use the same ChromaDB instance
+- Shared embedder (fastembed + jina-embeddings-v3)
+
+### 99e234d — Fix: cache-bust HTML, no-cache headers
+- Added cache-busting mechanism to HTML templates
+- Set no-cache headers to prevent stale content
+
+### 0b0c9bb — Switched to scrinium collection + logging + upload debug
+- Changed collection name to `scrinium` for clarity
+- Added structured logging throughout
+- Upload debug mode for troubleshooting
+
+## 2026-07-07
+
+### d65326a — fix: upload timeout + OOM handling + abort in browser
+- Fixed upload timeout issues with large documents
+- Added OOM (out-of-memory) handling during conversion
+- Browser-side abort support for cancelled uploads
+
+### 19a3fb3 — fix: real upload progress bar via XHR + conversion status
+- Replaced fake progress with real XHR upload progress tracking
+- Added conversion status feedback to the user
+
+### d1eb8e5 — Unify: single docs collection, shared embedder with docling-search
+- Unified document storage: single ChromaDB collection for all sources
+- Embedder now shared explicitly between Scrinium and docling-search
+- Ensured documents uploaded via web are accessible via MCP tools and vice versa
+
+### e78e6f0 — fix: no timeout on upload, graceful error if browser slept
+- Removed upload timeout entirely
+- Graceful error handling when browser goes to sleep during upload
+
+### 8cbde19 — docs: full stack architecture doc
+- Documented the full stack: Scrinium + docling-mcp + docling-search
+- Architecture overview and component relationships
+
+### 4a46706 — fix: docling timeout 300→3600s (60 min for large PDFs)
+- Increased docling conversion timeout from 5 minutes to 60 minutes
+- Handles very large PDF documents that take long to parse
+
+### e514b24 — fix: metadata format aligned with docling-search (doc_name+header)
+- Metadata format standardized to match docling-search conventions
+- Uses `doc_name` + `header` fields consistently for cross-component compatibility
